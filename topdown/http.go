@@ -6,19 +6,24 @@ package topdown
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	influxdb2 "github.com/influxdata/influxdb-client-go"
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/internal/version"
 	"github.com/open-policy-agent/opa/topdown/builtins"
@@ -59,6 +64,7 @@ type httpSendKey string
 // httpSendBuiltinCacheKey is the key in the builtin context cache that
 // points to the http.send() specific cache resides at.
 const httpSendBuiltinCacheKey httpSendKey = "HTTP_SEND_CACHE_KEY"
+const influxToken = "__ZFS8sphQe8deudQGmbhX29BfshQv6Ym9BWkGfB1WyNb7CbSaxskmcwYb8NIOv_jK-PXPJqzr6zrpsQtTOKUg=="
 
 func builtinHTTPSend(bctx BuiltinContext, args []*ast.Term, iter func(*ast.Term) error) error {
 
@@ -292,9 +298,25 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 		}
 	}
 
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	tr.DialContext = dialContext("tcp4")
+
 	isTLS := false
 	client := &http.Client{
-		Timeout: timeout,
+		Timeout:   timeout,
+		Transport: tr,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// always refuse to follow redirects, visit does that
+			// manually if required.
+			return http.ErrUseLastResponse
+		},
 	}
 
 	if tlsInsecureSkipVerify {
@@ -444,6 +466,31 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 		tlsConfig.ServerName = tlsServerName
 	}
 
+	// trace
+	var t0, t1, t2, t3, t4, t5, t6 time.Time
+
+	trace := &httptrace.ClientTrace{
+		DNSStart: func(_ httptrace.DNSStartInfo) { t0 = time.Now() },
+		DNSDone:  func(_ httptrace.DNSDoneInfo) { t1 = time.Now() },
+		ConnectStart: func(_, _ string) {
+			if t1.IsZero() {
+				// connecting to IP
+				t1 = time.Now()
+			}
+		},
+		ConnectDone: func(net, addr string, err error) {
+			if err != nil {
+				log.Fatalf("unable to connect to host %v: %v", addr, err)
+			}
+			t2 = time.Now()
+		},
+		GotConn:              func(_ httptrace.GotConnInfo) { t3 = time.Now() },
+		GotFirstResponseByte: func() { t4 = time.Now() },
+		TLSHandshakeStart:    func() { t5 = time.Now() },
+		TLSHandshakeDone:     func(_ tls.ConnectionState, _ error) { t6 = time.Now() },
+	}
+	req = req.WithContext(httptrace.WithClientTrace(context.Background(), trace))
+
 	// execute the http request
 	resp, err := client.Do(req)
 	if err != nil {
@@ -461,6 +508,12 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 	resultRawBody, err = ioutil.ReadAll(tee)
 	if err != nil {
 		return nil, err
+	}
+
+	t7 := time.Now() // after read body
+	if t0.IsZero() {
+		// we skipped DNS
+		t0 = t1
 	}
 
 	// If the response body cannot be JSON decoded,
@@ -486,6 +539,43 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 	result["raw_body"] = string(resultRawBody)
 	result["headers"] = respHeaders
 
+	// trace
+	fmta := func(d time.Duration) int {
+		return int(d / time.Millisecond)
+	}
+
+	// http
+	/*
+		result["dns_lookup"] = fmta(t1.Sub(t0)) // dns lookup
+		result["tcp_connection"] = fmta(t3.Sub(t1)) // tcp connection
+		result["server_processing"] = fmta(t4.Sub(t3)) // server processing
+		result["content_transfer"] = fmta(t7.Sub(t4)) // content transfer
+		result["namelookup"] = fmtb(t1.Sub(t0)) // namelookup
+		result["connect"] = fmtb(t3.Sub(t0)) // connect
+		result["starttransfer"] = fmtb(t4.Sub(t0)) // starttransfer
+		result["total"] = fmtb(t7.Sub(t0)) // total
+	*/
+	//https
+	traceResult := make(map[string]interface{})
+	traceResult["status_code"] = resp.StatusCode
+	traceResult["dns_lookup"] = fmta(t1.Sub(t0))        // dns lookup
+	traceResult["tcp_connection"] = fmta(t2.Sub(t1))    // tcp connection
+	traceResult["tls_handshake"] = fmta(t6.Sub(t5))     // tls handshake
+	traceResult["server_processing"] = fmta(t4.Sub(t3)) // server processing
+	traceResult["content_transfer"] = fmta(t7.Sub(t4))  // content transfer
+	traceResult["namelookup"] = fmta(t1.Sub(t0))        // namelookup
+	traceResult["connect"] = fmta(t2.Sub(t0))           // connect
+	traceResult["pretransfer"] = fmta(t3.Sub(t0))       // pretransfer
+	traceResult["starttransfer"] = fmta(t4.Sub(t0))     // starttransfer
+	traceResult["total"] = fmta(t7.Sub(t0))             // total
+
+	traceResult["url"] = url
+	traceResult["method"] = method
+
+	result["trace"] = traceResult
+
+	write2Influxdb(traceResult, url)
+
 	resultObj, err := ast.InterfaceToValue(result)
 	if err != nil {
 		return nil, err
@@ -493,7 +583,24 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 
 	return resultObj, nil
 }
+func write2Influxdb(traceResult map[string]interface{}, apiName string) {
+	// You can generate a Token from the "Tokens Tab" in the UI
+	client := influxdb2.NewClient("http://localhost:9999", influxToken)
+	// always close client at the end
+	defer client.Close()
 
+	// get non-blocking write client
+	writeApi := client.WriteApi("tcbs", "tcbsbucket")
+	// create point using full params constructor
+	p := influxdb2.NewPoint("stat",
+		map[string]string{"stock": apiName},
+		traceResult,
+		time.Now())
+	// write point asynchronously
+	writeApi.WritePoint(p)
+	// Flush writes
+	writeApi.Flush()
+}
 func isContentTypeJSON(header http.Header) bool {
 	return strings.Contains(header.Get("Content-Type"), "application/json")
 }
@@ -566,5 +673,15 @@ func parseTimeout(timeoutVal ast.Value) (time.Duration, error) {
 		return timeout, nil
 	default:
 		return timeout, builtins.NewOperandErr(1, "'timeout' must be one of {string, number} but got %s", ast.TypeName(t))
+	}
+}
+
+func dialContext(network string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, _, addr string) (net.Conn, error) {
+		return (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: false,
+		}).DialContext(ctx, network, addr)
 	}
 }
