@@ -13,12 +13,13 @@ require (
 	github.com/golang/protobuf v0.0.0-20181025225059-d3de96c4c28e // indirect
 	github.com/gorilla/mux v0.0.0-20181024020800-521ea7b17d02
 	github.com/inconshreveable/mousetrap v1.0.0 // indirect
+	github.com/influxdata/influxdb-client-go v1.0.0
 	github.com/konsorten/go-windows-terminal-sequences v1.0.2 // indirect
 	github.com/mattn/go-runewidth v0.0.0-20181025052659-b20a3daf6a39 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect
 	github.com/olekukonko/tablewriter v0.0.1
 	github.com/peterh/liner v0.0.0-20170211195444-bf27d3ba8e1d
-	github.com/pkg/errors v0.0.0-20181023235946-059132a15dd0
+	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v0.0.0-20181025174421-f30f42803563
 	github.com/prometheus/client_model v0.0.0-20180712105110-5c3871d89910 // indirect
 	github.com/prometheus/common v0.0.0-20181020173914-7e9e6cabbd39 // indirect
@@ -31,5 +32,5 @@ require (
 	golang.org/x/lint v0.0.0-20181023182221-1baf3a9d7d67
 	golang.org/x/tools v0.0.0-20190920225731-5eefd052ad72
 	gopkg.in/fsnotify.v1 v1.4.7
-	gopkg.in/yaml.v2 v2.2.1
+	gopkg.in/yaml.v2 v2.2.2
 )
