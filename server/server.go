@@ -44,6 +44,7 @@ import (
 	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/version"
 	"github.com/open-policy-agent/opa/watch"
+	"go.elastic.co/apm/module/apmgorilla"
 )
 
 // AuthenticationScheme enumerates the supported authentication schemes. The
@@ -517,7 +518,7 @@ func (s *Server) initRouter() {
 	if router == nil {
 		router = mux.NewRouter()
 	}
-
+	router.Use(apmgorilla.Middleware())
 	router.UseEncodedPath()
 	router.StrictSlash(true)
 	if s.metrics != nil {
@@ -1365,6 +1366,7 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 		writer.ErrorAuto(w, err)
 		return
 	}
+
 	writer.JSON(w, 200, result, pretty)
 }
 

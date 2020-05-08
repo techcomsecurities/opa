@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"github.com/sirupsen/logrus"
 	"io"
 	"io/ioutil"
 	"log"
@@ -23,10 +24,12 @@ import (
 	"strings"
 	"time"
 
-	influxdb2 "github.com/influxdata/influxdb-client-go"
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/internal/version"
 	"github.com/open-policy-agent/opa/topdown/builtins"
+	"go.elastic.co/apm/module/apmhttp"
+	"go.elastic.co/apm/module/apmot"
+	"github.com/opentracing/opentracing-go"
 )
 
 const defaultHTTPRequestTimeoutEnv = "HTTP_SEND_TIMEOUT"
@@ -64,7 +67,6 @@ type httpSendKey string
 // httpSendBuiltinCacheKey is the key in the builtin context cache that
 // points to the http.send() specific cache resides at.
 const httpSendBuiltinCacheKey httpSendKey = "HTTP_SEND_CACHE_KEY"
-const influxToken = "__ZFS8sphQe8deudQGmbhX29BfshQv6Ym9BWkGfB1WyNb7CbSaxskmcwYb8NIOv_jK-PXPJqzr6zrpsQtTOKUg=="
 
 func builtinHTTPSend(bctx BuiltinContext, args []*ast.Term, iter func(*ast.Term) error) error {
 
@@ -201,7 +203,8 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 		} else {
 			// Most parameters are strings, so consolidate the type checking.
 			switch key {
-			case "method",
+			case "test_case",
+				"method",
 				"url",
 				"raw_body",
 				"tls_ca_cert",
@@ -300,17 +303,17 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		MaxIdleConns:          10000,
+		IdleConnTimeout:       10000 * time.Second,
+		TLSHandshakeTimeout:   10000 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	tr.DialContext = dialContext("tcp4")
+	// tr.DialContext = dialContext("tcp4")
 
 	isTLS := false
-	client := &http.Client{
-		Timeout:   timeout,
+	httpClient := &http.Client{
+		Timeout:   timeout * 600000,
 		Transport: tr,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			// always refuse to follow redirects, visit does that
@@ -318,6 +321,9 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 			return http.ErrUseLastResponse
 		},
 	}
+
+	// apmhttp.WrapClient instruments the given http.Client
+	client := apmhttp.WrapClient(httpClient)
 
 	if tlsInsecureSkipVerify {
 		isTLS = true
@@ -491,11 +497,32 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 	}
 	req = req.WithContext(httptrace.WithClientTrace(context.Background(), trace))
 
+	opentracing.SetGlobalTracer(apmot.New())
+
+	parent, ctx := opentracing.StartSpanFromContext(context.Background(), method + " " + url)
+	parent.SetTag("Method", method)
+	parent.SetTag("Url", url)
+	child, _ := opentracing.StartSpanFromContext(ctx, url)
+
 	// execute the http request
 	resp, err := client.Do(req)
+
+
+
 	if err != nil {
+		logrus.WithField("error", err).Errorf("can't call http  %s", url)
+
+		parent.SetTag("error", true)
+		child.Finish()
+		parent.Finish()
 		return nil, err
 	}
+
+	if resp.StatusCode != 200 {
+		parent.SetTag("error", true)
+	}
+	child.Finish()
+	parent.Finish()
 
 	defer resp.Body.Close()
 
@@ -507,6 +534,7 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 	tee := io.TeeReader(resp.Body, &buf)
 	resultRawBody, err = ioutil.ReadAll(tee)
 	if err != nil {
+		logrus.WithField("error", err).Errorf("can't call http  %s", url)
 		return nil, err
 	}
 
@@ -537,6 +565,7 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 	result["status_code"] = resp.StatusCode
 	result["body"] = resultBody
 	result["raw_body"] = string(resultRawBody)
+	logrus.Infof("url %s http response  %s status code %v", url, string(resultRawBody), resp.StatusCode)
 	result["headers"] = respHeaders
 
 	// trace
@@ -572,9 +601,10 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 	traceResult["url"] = url
 	traceResult["method"] = method
 
-	result["trace"] = traceResult
+	// store to datasource
+	go writeHttpTracing(traceResult)
 
-	write2Influxdb(traceResult, url)
+	result["trace"] = traceResult
 
 	resultObj, err := ast.InterfaceToValue(result)
 	if err != nil {
@@ -583,23 +613,18 @@ func executeHTTPRequest(bctx BuiltinContext, obj ast.Object) (ast.Value, error) 
 
 	return resultObj, nil
 }
-func write2Influxdb(traceResult map[string]interface{}, apiName string) {
-	// You can generate a Token from the "Tokens Tab" in the UI
-	client := influxdb2.NewClient("http://localhost:9999", influxToken)
-	// always close client at the end
-	defer client.Close()
-
-	// get non-blocking write client
-	writeApi := client.WriteApi("tcbs", "tcbsbucket")
-	// create point using full params constructor
-	p := influxdb2.NewPoint("stat",
-		map[string]string{"stock": apiName},
-		traceResult,
-		time.Now())
-	// write point asynchronously
-	writeApi.WritePoint(p)
-	// Flush writes
-	writeApi.Flush()
+func writeHttpTracing(traceResult map[string]interface{})  {
+	jsonStr, err := json.Marshal(traceResult)
+	if err != nil{
+		logrus.WithField("error", err).Error("Marshall tracing result has an error")
+		return
+	}
+	_, err = http.Post("http://localhost:8989/v1/tracing/http", "application/json", bytes.NewBuffer(jsonStr))
+	if err != nil{
+		logrus.WithField("err",err).Errorf("Store trace result has an error")
+		return
+	}
+	logrus.Infof("Done store trace result")
 }
 func isContentTypeJSON(header http.Header) bool {
 	return strings.Contains(header.Get("Content-Type"), "application/json")
